@@ -6,7 +6,7 @@
  Nathan Seidle
  nathan at sparkfun.com
 
- Ported to ATmega368 and cleaned up by Roman Elizarov, 2010.
+ Cleaned up, added debounce and level control by Roman Elizarov, 2010.
 
  Generates random sequence, plays music, and displays button lights.
 
