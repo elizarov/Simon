@@ -1,10 +1,12 @@
 /*
+ SIMON GAME
+
  6-19-2007
  Copyright Spark Fun Electronics© 2009
  Nathan Seidle
  nathan at sparkfun.com
 
- Simon Game ported for the ATmega168
+ Ported to ATmega368 and cleaned up by Roman Elizarov, 2010.
 
  Generates random sequence, plays music, and displays button lights.
 
@@ -17,8 +19,7 @@
 
  The tones are close, but probably off a bit, but they sound all right.
 
- The current version of Simon uses the ATmega168. The external osciallator was removed to reduce component count.
- This version of simon relies on the internal default 1MHz osciallator. Do not set the external fuses.
+ This version of Simon relies on the internal default 1MHz oscillator. Do not set the external fuses.
  */
 
 #include <avr/io.h>
@@ -38,9 +39,11 @@
 #define LED3 4
 #define LED4 8
 
+#define DEBOUNCE 5  // debounce delay in ms
+
 uint8_t game_string[64];
 uint8_t game_string_position;
-uint8_t game_level = 5;
+uint8_t game_level = 5; // default game level if game starts with single button press.
 
 //Define functions
 //======================
@@ -51,11 +54,12 @@ void leds(uint8_t);
 uint8_t check_button();
 uint8_t button_count(uint8_t);
 uint8_t read_button(uint16_t);
-void toner(uint8_t, uint16_t);
-void add_to_string();
-void play_string();
 void play_loser();
 void play_winner();
+void play_string();
+void add_to_string();
+uint8_t random();
+void toner(uint8_t, uint16_t);
 
 inline static void delay_us(uint16_t d) {
 	_delay_loop_2(d >> 2); // 4 iterations per loop
@@ -112,12 +116,51 @@ void ioinit(void) {
 	PORTB = 0b00000011; //Enable pull-ups on buttons 2,3
 	PORTD = 0b11000000; //Enable pull-ups on buttons 0,1
 
-    //Init timer 2
+    //Init timer 2 for random number generation
     TCCR2B = (1<<CS22); // Set prescaler to clk/64 = 64us per tick = 16ms to loop counter
 
 	sei();
 }
 
+//Display fancy LED pattern waiting for any button to be pressed
+//Wait for user to begin game
+void welcome() {
+	uint8_t choice = 0;
+	uint8_t buttons;
+	uint8_t cnt;
+	uint8_t led = LED1;
+
+	do {
+		leds(led);
+		choice = read_button(100); // 100ms max wait
+		led = led == LED4 ? LED1 : led << 1; // next led
+	} while (choice == 0);
+
+	// wait more until all buttons are released
+	leds(0);
+	buttons = choice;
+	do {
+		choice = check_button();
+		buttons |= choice;
+	} while (choice != 0);
+
+	// configure game level depending on number of buttons pressed
+	cnt = button_count(buttons);
+	if (cnt == 2)
+		game_level = 15;
+	else if (cnt == 3)
+		game_level = 20;
+	else if (cnt == 4)
+		game_level = 25;
+
+	//Indicate the start of game play
+	leds(LED1 | LED2 | LED3 | LED4);
+	_delay_ms(1000);
+	leds(0);
+	_delay_ms(250);
+}
+
+//Lights leds according to bitmask
 void leds(uint8_t mask) {
   if (mask & LED1)
 	  sbi(PORTB, 2);
@@ -137,35 +180,6 @@ void leds(uint8_t mask) {
 	  cbi(PORTD, 5);
 }
 
-//Display fancy LED pattern waiting for any button to be pressed
-//Wait for user to begin game
-void welcome() {
-	uint8_t cnt;
-	uint8_t led = LED1;
-	while (1) {
-		leds(led);
-		cnt = button_count(read_button(100)); // 100ms max wait
-		if (cnt)
-			break;
-		if (led == LED4)
-			led = LED1;
-		else
-			led = led << 1;
-	}
-	if (cnt == 2)
-		game_level = 15;
-	else if (cnt == 3)
-		game_level = 20;
-	else if (cnt == 4)
-		game_level = 25;
-
-	//Indicate the start of game play
-	leds(LED1 | LED2 | LED3 | LED4);
-	_delay_ms(1000);
-	leds(0);
-	_delay_ms(250);
-}
-
 //Returns a bitmask of buttons pressed
 uint8_t check_button(void) {
 	uint8_t choice = 0;
@@ -180,6 +194,7 @@ uint8_t check_button(void) {
 	return choice;
 }
 
+//Counts number of button pressed
 uint8_t button_count(uint8_t choice) {
 	uint8_t cnt = 0;
 	if (choice & LED1) cnt++;
@@ -189,20 +204,17 @@ uint8_t button_count(uint8_t choice) {
 	return cnt;
 }
 
+//Waits until button pressed and released or timeout (in millis) passes
 uint8_t read_button(uint16_t time_limit) {
+	uint8_t buttons = 0;
 	uint8_t choice = 0;
-	uint8_t check;
-	while (1) {
-		check = check_button();
-		choice |= check;
-		if (check == 0 && choice != 0)
-			break; // was pressed, but not pressed anymore
-		_delay_ms(1); // this delay also de-bounces read
-		if (time_limit == 0)
-			return 0;
-		time_limit--;
-	}
-	return choice;
+	do {
+		choice = check_button();
+		buttons |= choice;
+		_delay_ms(DEBOUNCE); // this 5 ms delay also de-bounces read
+		time_limit -= DEBOUNCE;
+	} while (time_limit >= DEBOUNCE && (buttons == 0 || choice != 0));
+	return buttons;
 }
 
 //Plays the loser sounds
@@ -258,14 +270,6 @@ void play_string(void) {
 	}
 }
 
-uint32_t rand_seed;
-
-uint8_t random() {
-	rand_seed += TCNT2; // add some physical randomness, so that each start is different
-	rand_seed = (rand_seed * 22695477L + 1);
-	return rand_seed >> 16;
-}
-
 //Adds a new random button to the game sequence based on the current timer elapsed
 void add_to_string(void) {
 	uint8_t new_button = 1 << (random() & 3);
@@ -273,19 +277,21 @@ void add_to_string(void) {
 	game_string_position++;
 }
 
+// Generates random number
+uint8_t random() {
+	static uint32_t rand_seed;
+	rand_seed += TCNT2; // add some physical randomness, so that each start is different
+	rand_seed = (rand_seed * 22695477L + 1);
+	return rand_seed >> 16;
+}
+
 //Tone generator
 //(red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
 //(green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
 //(blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz - 1.702ms - 0.851ms pulse
 //(yellow, lower right, a perfect fourth higher than the lower left) - 784Hz - 1.276ms - 0.638ms pulse
-
-//Loop length is calculated to run buzz tone for 1ms. Buzz_length of 50 means tone will play for 50ms
-//Red = 2.272ms = 2272us
-//loop_length = 1
 void toner(uint8_t tone, uint16_t buzz_length_ms) {
-	uint32_t buzz_length_us;
-	buzz_length_us = buzz_length_ms * (uint32_t) 1000;
-
+	uint32_t buzz_length_us = buzz_length_ms * (uint32_t) 1000;
 	uint16_t buzz_delay;
 
 	switch (tone) {
@@ -314,15 +320,9 @@ void toner(uint8_t tone, uint16_t buzz_length_ms) {
 	}
 
 	//Run buzzer for buzz_length_us
-	while (1) {
+	while (buzz_length_us >= 2 * buzz_delay) {
 		//Subtract the buzz_delay from the overall length
-		if (buzz_delay > buzz_length_us)
-			break;
-		buzz_length_us -= buzz_delay;
-
-		if (buzz_delay > buzz_length_us)
-			break;
-		buzz_length_us -= buzz_delay;
+		buzz_length_us -= 2 * buzz_delay;
 
 		//Toggle the buzzer at various speeds
 		cbi(BUZZER1_PORT, BUZZER1);
