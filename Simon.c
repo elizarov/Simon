@@ -94,7 +94,7 @@ inline void toggle_buzzer() {
 inline uint8_t random() {
 	rand_seed ^= TCNT1; // adds physical timing randomness
 	rand_seed = (rand_seed * 22695477L + 1); // linear congruent PRNG
-	return rand_seed >> 16;
+	return rand_seed >> 24;
 }
 
 // Waits a specified number of microseconds, assumes 1 MHz clock (1us tick)
@@ -149,32 +149,6 @@ inline static void play_note(uint16_t length_ms, uint16_t half_period_us) {
   as well as button lights and tones
  *---------------------------------------------------------------------------*/
 
-// Tone generator
-// (red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
-// (green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
-// (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz - 1.702ms - 0.851ms pulse
-// (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz - 1.276ms - 0.638ms pulse
-inline static void toner(uint8_t mask, uint16_t length_ms) {
-	uint16_t half_period_us = 0;
-	set_leds(mask);
-	switch (mask) {
-	case LED0:
-		half_period_us = 1136; //440Hz = 2272us Upper left, Red
-		break;
-	case LED1:
-		half_period_us = 568; //Upper right, Green
-		break;
-	case LED2:
-		half_period_us = 851; //Lower left, Blue
-		break;
-	case LED3:
-		half_period_us = 638; //Lower right, Yellow
-		break;
-	}
-	play_note(length_ms, half_period_us);
-	set_leds(0); // Turn off all LEDs
-}
-
 // Plays the loser sounds
 inline static void play_loser(void) {
 	set_leds(LED0 | LED1);
@@ -222,29 +196,38 @@ inline static void play_start() {
 
 #define MAX_GAME_LEVEL 64
 
-uint8_t game_string[MAX_GAME_LEVEL];
-uint8_t game_string_position;
-uint8_t game_level = 5; // default game level if game starts with single button press.
+uint8_t game[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
+uint8_t game_position;        // current game position from 0
+uint8_t game_level = 5;       // default game level if game starts with single button press.
+
+// (red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
+// (green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
+// (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz - 1.702ms - 0.851ms pulse
+// (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz - 1.276ms - 0.638ms pulse
+uint16_t BUTTON_TONES[4] = { 1136, 568, 851, 638 };
+
+// Generates button tone and highlights the corresponding button
+void button_tone(uint8_t button) {
+	set_leds(_BV(button));
+	play_note(150, BUTTON_TONES[button]);
+	set_leds(0); // Turn off all LEDs
+}
 
 // Starts new game
 inline void new_game() {
-	game_string_position = 0;
+	game_position = 0;
 }
 
 // Adds a new random button to the game sequence
-inline void add_to_game_string(void) {
-	uint8_t new_button = 1 << (random() & 3);
-	game_string[game_string_position] = new_button;
-	game_string_position++;
+inline void add_to_game(void) {
+	game[game_position++] = random() & 3;
 }
 
-// Plays the current contents of the game string
-inline static void play_game_string(void) {
-	uint8_t string_pos;
-	uint8_t button;
-	for (string_pos = 0; string_pos < game_string_position; string_pos++) {
-		button = game_string[string_pos];
-		toner(button, 150);
+// Plays the current contents of the game sequence
+inline static void replay_game(void) {
+	uint8_t pos;
+	for (pos = 0; pos < game_position; pos++) {
+		button_tone(game[pos]);
 		_delay_ms(150);
 	}
 }
@@ -252,24 +235,24 @@ inline static void play_game_string(void) {
 // Display fancy LED pattern waiting for any button to be pressed
 // Wait for user to begin game
 inline static void wait_start() {
-	uint8_t choice = 0;
+	uint8_t mask = 0;
 	uint8_t buttons;
 	uint8_t cnt;
 	uint8_t led = LED0;
 
 	do {
 		set_leds(led);
-		choice = wait_buttons(100); // 100ms max wait
+		mask = wait_buttons(100); // 100ms max wait
 		led = led == LED3 ? LED0 : led << 1; // next led
-	} while (choice == 0);
+	} while (mask == 0);
 
 	// wait more until all buttons are released
 	set_leds(0);
-	buttons = choice;
+	buttons = mask;
 	do {
-		choice = get_buttons();
-		buttons |= choice;
-	} while (choice != 0);
+		mask = get_buttons();
+		buttons |= mask;
+	} while (mask != 0);
 
 	// configure game level depending on number of buttons pressed
 	cnt = buttons_count(buttons);
@@ -287,10 +270,10 @@ inline static void wait_start() {
  *---------------------------------------------------------------------------*/
 
 int main(void) {
-	uint8_t choice;
-	uint8_t current_pos;
+	uint8_t mask;
+	uint8_t pos;
 
-	hal_init(); //Setup IO pins and defaults
+	hal_init(); // Setup IO pins and defaults
 
 BEGIN_GAME:
 
@@ -299,24 +282,24 @@ BEGIN_GAME:
 	new_game();
 
 	while (1) {
-		add_to_game_string(); // Add the first button to the string
-		play_game_string(); // Play the current contents of the game string back for the player
+		add_to_game(); // Add the first button to the game sequence
+		replay_game(); // Play the current contents of the game sequence back for the player
 
-		// Wait for user to input buttons until they mess up, reach the end of the current string, or time out
-		for (current_pos = 0; current_pos < game_string_position; current_pos++) {
-			choice = wait_buttons(3000); // Wait at most 3 sec
-			if (buttons_count(choice) == 1)
-				toner(choice, 150); // Fire the button and play the button tone
-			if (choice != game_string[current_pos]) {
-				play_loser(); // Play anoying loser tones
+		// Wait for user to input buttons until they mess up, reach the end of the current sequence, or time out
+		for (pos = 0; pos < game_position; pos++) {
+			mask = wait_buttons(3000); // Wait at most 3 sec
+			if (mask == _BV(game[pos])) {
+				button_tone(game[pos]); // Fire the button and play the button tone
+			} else {
+				play_loser(); // Play annoying loser tones
 				goto BEGIN_GAME;
 			}
-		}// End user input loop
+		}
 
-		// If user reaches the game length of X, they win!
-		if (current_pos == game_level) {
-			play_winner(); //Play winner tones
-			game_level++; // next level
+		// If user reaches the game length of game level, they win!
+		if (pos == game_level) {
+			play_winner(); // Play winner tones
+			game_level++; // Next level
 			goto BEGIN_GAME;
 		}
 
