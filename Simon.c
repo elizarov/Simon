@@ -51,7 +51,12 @@
 #define LED2 _BV(2)
 #define LED3 _BV(3)
 
-uint32_t rand_seed; // current seed for random
+typedef union {
+	uint32_t value;
+	uint8_t bytes[4];
+} rand_seed_t;
+
+rand_seed_t rand_seed; // current seed for random
 
 // Initializes hardware abstraction layer
 inline void hal_init() {
@@ -62,8 +67,10 @@ inline void hal_init() {
 	PORTB = 0b00000011; // Enable pull-ups on buttons 2,3
 	PORTD = 0b11000000; // Enable pull-ups on buttons 0,1
 
-	// Init timer 1 for random number generation
-	TCCR1B = _BV(CS10); // No prescaler -- run timer 1:1 with CPU clock
+	// Init timer 0 & 2 for random number generation (see random method)
+	// Together they will act like a 16bit timer
+	TCCR0B = _BV(CS00);             // Run timer0 1:1   with CPU clock (no prescaler)
+	TCCR2B = _BV(CS22) | _BV(CS21); // Run timer2 1:256 with CPU clock
 }
 
 // Lights leds according to bitmask
@@ -84,13 +91,13 @@ uint8_t get_buttons() {
 	return mask;
 }
 
-// Enables buzzer and sets it to initial state
+// Enables buzzer and sets it to initial state (one leg high, other low)
 inline void enable_buzzer() {
 	cbi(PORTD, 3);
 	sbi(PORTD, 4);
 }
 
-// Disables buzzer, so that it does not consume power
+// Disables buzzer, so that it does not consume power (both legs low)
 inline void disable_buzzer() {
 	cbi(PORTD, 3);
 	cbi(PORTD, 4);
@@ -102,11 +109,14 @@ inline void toggle_buzzer() {
 	sbi(PIND, 4);
 }
 
-// Generates random byte
+// Generates random byte using timer0&2 as randomness source
 inline uint8_t random() {
-	rand_seed ^= TCNT1; // adds physical timing randomness
-	rand_seed = (rand_seed * 22695477L + 1); // linear congruent PRNG
-	return rand_seed >> 24;
+	rand_seed_t cur = rand_seed;
+	cur.bytes[0] ^= TCNT0; // mangle seed based on timer0
+	cur.bytes[1] ^= TCNT2; // mangle seed based on timer2
+	cur.value = (cur.value * 22695477L + 1); // linear congruent PRNG
+	rand_seed = cur;
+	return cur.bytes[3]; // use most significant byte as random value
 }
 
 // Waits a specified number of microseconds, assumes 1 MHz clock (1us tick)
