@@ -60,7 +60,7 @@ inline void hal_init() {
 	DDRD = 0b00111110;  // LEDs, buttons, buzzer, TX/RX
 
 	PORTB = 0b00000011; // Enable pull-ups on buttons 2,3
-	PORTD = 0b11001000; // Enable pull-ups on buttons 0,1, enable buzzer initial state
+	PORTD = 0b11000000; // Enable pull-ups on buttons 0,1
 
 	// Init timer 1 for random number generation
 	TCCR1B = _BV(CS10); // No prescaler -- run timer 1:1 with CPU clock
@@ -82,6 +82,18 @@ uint8_t get_buttons() {
 	if (!getbit(PIND, 7)) mask |= LED2;
 	if (!getbit(PIND, 6)) mask |= LED3;
 	return mask;
+}
+
+// Enables buzzer and sets it to initial state
+inline void enable_buzzer() {
+	cbi(PORTD, 3);
+	sbi(PORTD, 4);
+}
+
+// Disables buzzer, so that it does not consume power
+inline void disable_buzzer() {
+	cbi(PORTD, 3);
+	cbi(PORTD, 4);
 }
 
 // Flips the buzzer between two states
@@ -134,13 +146,15 @@ uint8_t buttons_count(uint8_t mask) {
 }
 
 // Plays note of specified length (ms) and tone half-period (us)
-inline static void play_note(uint16_t length_ms, uint16_t half_period_us) {
+inline static void play_tone(uint16_t length_ms, uint16_t half_period_us) {
 	uint32_t length_us = length_ms * (uint32_t) 1000;
+	enable_buzzer();
 	while (length_us >= half_period_us) {
 		length_us -= half_period_us;
 		toggle_buzzer(); // Toggle the buzzer
 		delay_us(half_period_us);
 	}
+	disable_buzzer();
 }
 
 /*---------------------------------------------------------------------------*
@@ -151,26 +165,19 @@ inline static void play_note(uint16_t length_ms, uint16_t half_period_us) {
 
 // Plays the loser sounds
 inline static void play_loser(void) {
-	set_leds(LED0 | LED1);
-	play_note(250, 1500);
-	set_leds(LED2 | LED3);
-	play_note(250, 1500);
-	set_leds(LED0 | LED1);
-	play_note(250, 1500);
-	set_leds(LED2 | LED3);
-	play_note(250, 1500);
+	uint8_t i;
+	for (i = 0; i < 4; i++) {
+		set_leds((i & 1) ? (LED2 | LED3) : (LED0 | LED1));
+		play_tone(250, 1500);
+	}
 }
 
 // Plays the winner sounds
 inline static void play_winner(void) {
 	uint8_t x, y, z;
+	enable_buzzer();
 	for (z = 0; z < 4; z++) {
-		if ((z & 1) == 0) {
-			set_leds(LED1 | LED2);
-		} else {
-			set_leds(LED0 | LED3);
-		}
-
+		set_leds((z & 1) ? (LED0 | LED3) : (LED1 | LED2));
 		// Toggle the buzzer at various speeds
 		for (x = 250; x > 70; x--) {
 			for (y = 0; y < 6; y++) {
@@ -179,6 +186,7 @@ inline static void play_winner(void) {
 			}
 		}
 	}
+	disable_buzzer();
 }
 
 // Indicate the start of game play
@@ -191,14 +199,17 @@ inline static void play_start() {
 
 /*---------------------------------------------------------------------------*
   GAMEPLAY UTILITIES
-  These methods generate game string and play it back
+  These methods generate game string, play it back, test pressed button
+  sequence, and perform overall logic of a single game.
  *---------------------------------------------------------------------------*/
 
 #define MAX_GAME_LEVEL 64
+#define WINNER 1
+#define LOSER  0
 
-uint8_t game[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
-uint8_t game_position;        // current game position from 0
-uint8_t game_level = 5;       // default game level if game starts with single button press.
+uint8_t game_sequence[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
+uint8_t game_position;                 // current game position from 0
+uint8_t game_level = 5;                // default game level if game starts with single button press.
 
 // (red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
 // (green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
@@ -209,25 +220,25 @@ uint16_t BUTTON_TONES[4] = { 1136, 568, 851, 638 };
 // Generates button tone and highlights the corresponding button
 void button_tone(uint8_t button) {
 	set_leds(_BV(button));
-	play_note(150, BUTTON_TONES[button]);
+	play_tone(150, BUTTON_TONES[button]);
 	set_leds(0); // Turn off all LEDs
 }
 
 // Starts new game
-inline void new_game() {
+inline void new_game_sequence() {
 	game_position = 0;
 }
 
 // Adds a new random button to the game sequence
-inline void add_to_game(void) {
-	game[game_position++] = random() & 3;
+inline void add_to_game_sequence(void) {
+	game_sequence[game_position++] = random() & 3;
 }
 
 // Plays the current contents of the game sequence
-inline static void replay_game(void) {
+inline static void play_game_sequence(void) {
 	uint8_t pos;
 	for (pos = 0; pos < game_position; pos++) {
-		button_tone(game[pos]);
+		button_tone(game_sequence[pos]);
 		_delay_ms(150);
 	}
 }
@@ -264,47 +275,53 @@ inline static void wait_start() {
 		game_level = 25;
 }
 
+// Tests if game sequence is pressed correctly, returns WINNER or LOSER
+inline static uint8_t test_game_sequence() {
+	uint8_t mask;
+	uint8_t pos;
+	for (pos = 0; pos < game_position; pos++) {
+		mask = wait_buttons(3000); // Wait at most 3 sec for button press
+		if (mask != _BV(game_sequence[pos]))
+			return LOSER;
+		// Fire the button and play the button tone
+		button_tone(game_sequence[pos]);
+	}
+	return WINNER;
+}
+
+// Plays a single game and returns WINNER or LOSER
+inline static uint8_t single_game() {
+	new_game_sequence();
+	while (1) {
+		add_to_game_sequence();    // Add the button to the game sequence
+		play_game_sequence();      // Play the current contents of the game sequence back for the player
+		if (!test_game_sequence()) // Player presses buttons to repeat sequence
+			return LOSER;
+		// If user reaches the game level, they win!
+		if (game_position == game_level)
+			return WINNER;
+		// Otherwise, we need to wait just a hair before we play back longer sequence again
+		_delay_ms(1000);
+	}
+}
+
 /*---------------------------------------------------------------------------*
   MAIN
   Brings it all together
  *---------------------------------------------------------------------------*/
 
-int main(void) {
-	uint8_t mask;
-	uint8_t pos;
+void main() __attribute__ ((noreturn));
 
-	hal_init(); // Setup IO pins and defaults
-
-BEGIN_GAME:
-
-	wait_start();
-	play_start();
-	new_game();
-
-	while (1) {
-		add_to_game(); // Add the first button to the game sequence
-		replay_game(); // Play the current contents of the game sequence back for the player
-
-		// Wait for user to input buttons until they mess up, reach the end of the current sequence, or time out
-		for (pos = 0; pos < game_position; pos++) {
-			mask = wait_buttons(3000); // Wait at most 3 sec
-			if (mask == _BV(game[pos])) {
-				button_tone(game[pos]); // Fire the button and play the button tone
-			} else {
-				play_loser(); // Play annoying loser tones
-				goto BEGIN_GAME;
-			}
-		}
-
-		// If user reaches the game length of game level, they win!
-		if (pos == game_level) {
-			play_winner(); // Play winner tones
+void main() {
+	hal_init();  // Setup IO pins and defaults
+	while (1) {  // Repeatedly play games
+		wait_start();
+		play_start();
+		if (single_game()) {
+			play_winner();
 			game_level++; // Next level
-			goto BEGIN_GAME;
+		} else {
+			play_loser();
 		}
-
-		// Otherwise, we need to wait just a hair before we play back the last string
-		_delay_ms(1000);
 	}
-	return (0);
 }
