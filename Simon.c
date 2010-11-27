@@ -6,21 +6,19 @@
   Nathan Seidle
   nathan at sparkfun.com
 
-  Cleaned up, added debounce and level control by Roman Elizarov, 2010.
-
   Generates random sequence, plays music, and displays button lights.
 
   Simon tones from Wikipedia
+  * A (red, upper left) - 440Hz
+  * a (green, upper right, an octave higher than the upper right) - 880Hz
+  * D (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz
+  * G (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz
 
-  * A (red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
-  * a (green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
-  * D (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz - 1.702ms - 0.851ms pulse
-  * G (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz - 1.276ms - 0.638ms pulse
-
-  The tones are close, but probably off a bit, but they sound all right.
-
-  This version of Simon relies on the internal default 1MHz oscillator.
-  Do not set the external fuses.
+ *---------------------------------------------------------------------------*
+  Cleaned up, added debounce and level control by Roman Elizarov, 2010.
+  This version of Simon code does not depend on the clock source.
+  It can work with the internal default 1MHz oscillator or a higher external one,
+  provided that F_CPU is set property during compilation and fuzes are right.
  *---------------------------------------------------------------------------*/
 
 #include <avr/io.h>
@@ -51,13 +49,6 @@
 #define LED2 _BV(2)
 #define LED3 _BV(3)
 
-typedef union {
-	uint32_t value;
-	uint8_t bytes[4];
-} rand_seed_t;
-
-rand_seed_t rand_seed; // current seed for random
-
 // Initializes hardware abstraction layer
 inline void hal_init() {
 	// 1 = output, 0 = input
@@ -65,12 +56,18 @@ inline void hal_init() {
 	DDRD = 0b00111110;  // LEDs, buttons, buzzer, TX/RX
 
 	PORTB = 0b00000011; // Enable pull-ups on buttons 2,3
-	PORTD = 0b11000000; // Enable pull-ups on buttons 0,1
+	PORTD = 0b11001000; // Enable pull-ups on buttons 0,1 & initial buzzer state
 
-	// Init timer 0 & 2 for random number generation (see random method)
+	// Use timer0 & timer2 for random number generation (see random method)
 	// Together they will act like a 16bit timer
 	TCCR0B = _BV(CS00);             // Run timer0 1:1   with CPU clock (no prescaler)
 	TCCR2B = _BV(CS22) | _BV(CS21); // Run timer2 1:256 with CPU clock
+
+	// Use timer1 in Fast PWM mode 15 for buzzer, no prescaler
+	TCCR1A = _BV(WGM11) | _BV(WGM10);
+	TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);
+
+	sei(); // enable interrupts
 }
 
 // Lights leds according to bitmask
@@ -91,16 +88,37 @@ uint8_t get_buttons() {
 	return mask;
 }
 
-// Enables buzzer and sets it to initial state (one leg high, other low)
-inline void enable_buzzer() {
-	cbi(PORTD, 3);
-	sbi(PORTD, 4);
+// Remaining number of half periods for buzzer time1 ISR
+volatile uint16_t buzzer_count;
+
+// Equal to 1 when buzzer is working, 0 otherwise
+volatile uint8_t is_buzzing;
+
+// Converts frequency of sound (in HZ) into tone for set_buzzer
+#define HZ2TONE(freq)                  ((uint16_t)(F_CPU / (freq) / 2))
+
+// Converts tone and length (in ms) into count for set_buzzer
+#define TONELEN2COUNT(tone, length)    ((uint16_t)(((uint32_t)1000 * (length)) / (tone)))
+
+// Initializes buzzer for a sequence of tones
+// set_buzzer must be called asap after prepare to define a tone to play
+inline void prepare_buzzer() {
+	TCNT1 = 0;                // reset timer to zero
 }
 
-// Disables buzzer, so that it does not consume power (both legs low)
-inline void disable_buzzer() {
-	cbi(PORTD, 3);
-	cbi(PORTD, 4);
+// Starts playing tone with buzzer
+void set_buzzer(uint16_t tone, uint16_t count) {
+	cbi(TIMSK1, TOIE1);       // disable overflow interrupt
+	OCR1A = tone;             // set top to half period of the tone
+	buzzer_count = count;     // set count of half periods
+	is_buzzing = 1;           // set flag that we are active
+	sbi(TIFR1, TOV1);         // clear pending overflow interrupt flag
+	sbi(TIMSK1, TOIE1);       // enable overflow interrupt
+}
+
+// Stops buzzer
+inline void stop_buzzer() {
+	cbi(TIMSK1, TOIE1);       // disable overflow interrupt
 }
 
 // Flips the buzzer between two states
@@ -108,6 +126,26 @@ inline void toggle_buzzer() {
 	sbi(PIND, 3);
 	sbi(PIND, 4);
 }
+
+// Interrupt Service Routine for timer overflow to flip buzzer
+ISR(TIMER1_OVF_vect) {
+	if (is_buzzing) {
+		toggle_buzzer();
+		uint16_t remaining = buzzer_count - 1;
+		buzzer_count = remaining;
+		if (remaining == 0)
+			is_buzzing = 0;
+	}
+}
+
+// Typedef for random seed
+typedef union {
+	uint32_t value;
+	uint8_t bytes[4];
+} rand_seed_t;
+
+// Current seed for random()
+rand_seed_t rand_seed;
 
 // Generates random byte using timer0&2 as randomness source
 inline uint8_t random() {
@@ -119,15 +157,9 @@ inline uint8_t random() {
 	return cur.bytes[3]; // use most significant byte as random value
 }
 
-// Waits a specified number of microseconds, assumes 1 MHz clock (1us tick)
-inline static void delay_us(uint16_t time_us) {
-	_delay_loop_2(time_us >> 2); // delay_loop_2 has 4 ticks per loop
-}
-
 /*---------------------------------------------------------------------------*
-  UTILITY METHODS
-  These methods provide various utility function like button debouncing,
-  playing tones, etc.
+  UTILITY METHODS FOR BUTTONS
+  These methods provide utility function for button debouncing and counting.
  *---------------------------------------------------------------------------*/
 
 #define DEBOUNCE_MS 5  // debounce delay in ms
@@ -146,7 +178,7 @@ uint8_t wait_buttons(uint16_t time_ms) {
 }
 
 // Counts the number of button(s) pressed
-uint8_t buttons_count(uint8_t mask) {
+inline uint8_t buttons_count(uint8_t mask) {
 	uint8_t cnt = 0;
 	if (mask & LED0) cnt++;
 	if (mask & LED1) cnt++;
@@ -155,48 +187,44 @@ uint8_t buttons_count(uint8_t mask) {
 	return cnt;
 }
 
-// Plays note of specified length (ms) and tone half-period (us)
-inline static void play_tone(uint16_t length_ms, uint16_t half_period_us) {
-	uint32_t length_us = length_ms * (uint32_t) 1000;
-	enable_buzzer();
-	while (length_us >= half_period_us) {
-		length_us -= half_period_us;
-		toggle_buzzer(); // Toggle the buzzer
-		delay_us(half_period_us);
-	}
-	disable_buzzer();
-}
-
 /*---------------------------------------------------------------------------*
   AUDIO-VISUAL EFFECTS
   These methods provide various effects like winner and loose sequences,
   as well as button lights and tones
  *---------------------------------------------------------------------------*/
 
+// Plays specified tone (half period in ticks) with specified count of half periods
+void play_tone(uint16_t tone, uint16_t count) {
+	prepare_buzzer();
+	set_buzzer(tone, count);
+	while (is_buzzing);
+	stop_buzzer();
+}
+
+// Plays specified tone with a specified length (ms)
+#define PLAY_TONE_LENGTH(tone, length) play_tone(tone, TONELEN2COUNT(tone, length));
+
 // Plays the loser sounds
-inline static void play_loser(void) {
+inline void play_loser(void) {
 	uint8_t i;
 	for (i = 0; i < 4; i++) {
 		set_leds((i & 1) ? (LED2 | LED3) : (LED0 | LED1));
-		play_tone(250, 1500);
+		PLAY_TONE_LENGTH(HZ2TONE(333.33), 250);
 	}
 }
 
 // Plays the winner sounds
-inline static void play_winner(void) {
-	uint8_t x, y, z;
-	enable_buzzer();
+inline void play_winner(void) {
+	uint8_t x, z;
+	prepare_buzzer();
 	for (z = 0; z < 4; z++) {
 		set_leds((z & 1) ? (LED0 | LED3) : (LED1 | LED2));
-		// Toggle the buzzer at various speeds
 		for (x = 250; x > 70; x--) {
-			for (y = 0; y < 6; y++) {
-				toggle_buzzer();
-				delay_us(x);
-			}
+			set_buzzer(x * (F_CPU / 1000000), 6);
+			while (is_buzzing);
 		}
 	}
-	disable_buzzer();
+	stop_buzzer();
 }
 
 // Indicate the start of game play
@@ -217,20 +245,29 @@ inline static void play_start() {
 #define WINNER 1
 #define LOSER  0
 
+#define TONE0 HZ2TONE(440.00) // (red, upper left) - 440Hz
+#define TONE1 HZ2TONE(880.00) // (green, upper right, an octave higher than the upper right) - 880Hz
+#define TONE2 HZ2TONE(587.33) // (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz
+#define TONE3 HZ2TONE(784.00) // (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz
+
+#define BUTTON_LENGTH_MS 150  // play button tone for 150 ms
+
+#define COUNT0 TONELEN2COUNT(TONE0, BUTTON_LENGTH_MS)
+#define COUNT1 TONELEN2COUNT(TONE1, BUTTON_LENGTH_MS)
+#define COUNT2 TONELEN2COUNT(TONE2, BUTTON_LENGTH_MS)
+#define COUNT3 TONELEN2COUNT(TONE3, BUTTON_LENGTH_MS)
+
 uint8_t game_sequence[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
 uint8_t game_position;                 // current game position from 0
 uint8_t game_level = 5;                // default game level if game starts with single button press.
 
-// (red, upper left) - 440Hz - 2.272ms - 1.136ms pulse
-// (green, upper right, an octave higher than the upper right) - 880Hz - 1.136ms - 0.568ms pulse
-// (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz - 1.702ms - 0.851ms pulse
-// (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz - 1.276ms - 0.638ms pulse
-uint16_t BUTTON_TONES[4] = { 1136, 568, 851, 638 };
+uint16_t BUTTON_TONES[4] = {TONE0, TONE1, TONE2, TONE3};
+uint16_t BUTTON_COUNTS[4] = {COUNT0, COUNT1, COUNT2, COUNT3};
 
 // Generates button tone and highlights the corresponding button
 void button_tone(uint8_t button) {
 	set_leds(_BV(button));
-	play_tone(150, BUTTON_TONES[button]);
+	play_tone(BUTTON_TONES[button], BUTTON_COUNTS[button]);
 	set_leds(0); // Turn off all LEDs
 }
 
