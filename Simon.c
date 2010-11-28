@@ -19,6 +19,7 @@
   This version of Simon code does not depend on the clock source.
   It can work with the internal default 1MHz oscillator or a higher external one,
   provided that F_CPU is set property during compilation and fuzes are right.
+  It uses timer1 to generate tones to get a perfectly accurate frequency.
  *---------------------------------------------------------------------------*/
 
 #include <avr/io.h>
@@ -56,7 +57,7 @@ inline void hal_init() {
 	DDRD = 0b00111110;  // LEDs, buttons, buzzer, TX/RX
 
 	PORTB = 0b00000011; // Enable pull-ups on buttons 2,3
-	PORTD = 0b11001000; // Enable pull-ups on buttons 0,1 & initial buzzer state
+	PORTD = 0b11000000; // Enable pull-ups on buttons 0,1
 
 	// Use timer0 & timer2 for random number generation (see random method)
 	// Together they will act like a 16bit timer
@@ -102,7 +103,9 @@ volatile uint8_t is_buzzing;
 
 // Initializes buzzer for a sequence of tones
 // set_buzzer must be called asap after prepare to define a tone to play
-inline void prepare_buzzer() {
+void prepare_buzzer() {
+	cbi(PORTD, 3);            // one buzzer leg low
+	sbi(PORTD, 4);            // other buzzer leg high
 	TCNT1 = 0;                // reset timer to zero
 }
 
@@ -117,8 +120,10 @@ void set_buzzer(uint16_t tone, uint16_t count) {
 }
 
 // Stops buzzer
-inline void stop_buzzer() {
+void stop_buzzer() {
 	cbi(TIMSK1, TOIE1);       // disable overflow interrupt
+	cbi(PORTD, 3);            // one buzzer leg low
+	cbi(PORTD, 4);            // the other low, too, so that it does not consume power
 }
 
 // Flips the buzzer between two states
@@ -245,30 +250,30 @@ inline static void play_start() {
 #define WINNER 1
 #define LOSER  0
 
-#define TONE0 HZ2TONE(440.00) // (red, upper left) - 440Hz
-#define TONE1 HZ2TONE(880.00) // (green, upper right, an octave higher than the upper right) - 880Hz
-#define TONE2 HZ2TONE(587.33) // (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz
-#define TONE3 HZ2TONE(784.00) // (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz
+// Play button tone for 150 ms
+#define BUTTON_LENGTH_MS 150
 
-#define BUTTON_LENGTH_MS 150  // play button tone for 150 ms
+// Button Tone and Count array entries generation macro
+#define BTC(freq) HZ2TONE(freq), TONELEN2COUNT(HZ2TONE(freq), BUTTON_LENGTH_MS)
 
-#define COUNT0 TONELEN2COUNT(TONE0, BUTTON_LENGTH_MS)
-#define COUNT1 TONELEN2COUNT(TONE1, BUTTON_LENGTH_MS)
-#define COUNT2 TONELEN2COUNT(TONE2, BUTTON_LENGTH_MS)
-#define COUNT3 TONELEN2COUNT(TONE3, BUTTON_LENGTH_MS)
-
+// Current game variables
 uint8_t game_sequence[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
 uint8_t game_position;                 // current game position from 0
 uint8_t game_level = 5;                // default game level if game starts with single button press.
 
-uint16_t BUTTON_TONES[4] = {TONE0, TONE1, TONE2, TONE3};
-uint16_t BUTTON_COUNTS[4] = {COUNT0, COUNT1, COUNT2, COUNT3};
+uint16_t BUTTONS[8] = {
+		BTC(440.00), // (red, upper left) - 440Hz
+		BTC(880.00), // (green, upper right, an octave higher than the upper right) - 880Hz
+		BTC(587.33), // (blue, lower left, a perfect fourth higher than the upper left) - 587.33Hz
+		BTC(784.00)  // (yellow, lower right, a perfect fourth higher than the lower left) - 784Hz
+};
 
 // Generates button tone and highlights the corresponding button
 void button_tone(uint8_t button) {
-	set_leds(_BV(button));
-	play_tone(BUTTON_TONES[button], BUTTON_COUNTS[button]);
-	set_leds(0); // Turn off all LEDs
+	set_leds(_BV(button)); // Turn on button led
+	uint16_t *btc = &BUTTONS[2 * button]; // Pointer to BTC entry for the button
+	play_tone(*btc, *(btc + 1));
+	set_leds(0);           // Turn off all LEDs
 }
 
 // Starts new game
