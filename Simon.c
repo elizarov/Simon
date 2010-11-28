@@ -26,23 +26,23 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 
+#include "buzzer.h"
+
 /*---------------------------------------------------------------------------*
   HARDWARE ABSTRACTION LAYER (HAL)
   These methods hide and abstract all the hardware details of the specific
-  Simon board: ports where leds, buttons, and buzzer are connected, plus
-  hardware-specific approach to random number generation.
-  This is the only piece of code that works directly with hardware ports.
-  All ports are hard-coded in these methods.
+  Simon board: ports where leds and buttons, plus hardware-specific approach
+  to random number generation. All ports are hard-coded in these methods.
   Methods that are used only once are hand-marked as inline.
  *---------------------------------------------------------------------------*/
 
 // Utility macros to work with ports
-#define sbi(port, pin)          (port |= _BV(pin))
-#define cbi(port, pin)          (port &= ~_BV(pin))
-#define getbit(port, pin)       (port & _BV(pin))
-#define setbit(port, pin, val) \
-	if (val) sbi(port, pin);   \
-	    else cbi(port, pin);
+#define sbi(reg, bit)          (reg |= _BV(bit))
+#define cbi(reg, bit)          (reg &= ~_BV(bit))
+#define getbit(reg, bit)       (reg & _BV(bit))
+#define setbit(reg, bit, val) \
+	if (val) sbi(reg, bit);   \
+	    else cbi(reg, bit);
 
 // Bit masks that define leds and buttons for set_leds and get_buttons
 #define LED0 _BV(0)
@@ -64,11 +64,8 @@ inline void hal_init() {
 	TCCR0B = _BV(CS00);             // Run timer0 1:1   with CPU clock (no prescaler)
 	TCCR2B = _BV(CS22) | _BV(CS21); // Run timer2 1:256 with CPU clock
 
-	// Use timer1 in Fast PWM mode 15 for buzzer, no prescaler
-	TCCR1A = _BV(WGM11) | _BV(WGM10);
-	TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);
-
-	sei(); // enable interrupts
+	// Enable global interrupts (it is required for buzzer)
+	sei();
 }
 
 // Lights leds according to bitmask
@@ -87,60 +84,6 @@ uint8_t get_buttons() {
 	if (!getbit(PIND, 7)) mask |= LED2;
 	if (!getbit(PIND, 6)) mask |= LED3;
 	return mask;
-}
-
-// Remaining number of half periods for buzzer time1 ISR
-volatile uint16_t buzzer_count;
-
-// Equal to 1 when buzzer is working, 0 otherwise
-volatile uint8_t is_buzzing;
-
-// Converts frequency of sound (in HZ) into tone for set_buzzer
-#define HZ2TONE(freq)                  ((uint16_t)(F_CPU / (freq) / 2))
-
-// Converts tone and length (in ms) into count for set_buzzer
-#define TONELEN2COUNT(tone, length)    ((uint16_t)(((uint32_t)1000 * (length)) / (tone)))
-
-// Initializes buzzer for a sequence of tones
-// set_buzzer must be called asap after prepare to define a tone to play
-void prepare_buzzer() {
-	cbi(PORTD, 3);            // one buzzer leg low
-	sbi(PORTD, 4);            // other buzzer leg high
-	TCNT1 = 0;                // reset timer to zero
-}
-
-// Starts playing tone with buzzer
-void set_buzzer(uint16_t tone, uint16_t count) {
-	cbi(TIMSK1, TOIE1);       // disable overflow interrupt
-	OCR1A = tone;             // set top to half period of the tone
-	buzzer_count = count;     // set count of half periods
-	is_buzzing = 1;           // set flag that we are active
-	sbi(TIFR1, TOV1);         // clear pending overflow interrupt flag
-	sbi(TIMSK1, TOIE1);       // enable overflow interrupt
-}
-
-// Stops buzzer
-void stop_buzzer() {
-	cbi(TIMSK1, TOIE1);       // disable overflow interrupt
-	cbi(PORTD, 3);            // one buzzer leg low
-	cbi(PORTD, 4);            // the other low, too, so that it does not consume power
-}
-
-// Flips the buzzer between two states
-inline void toggle_buzzer() {
-	sbi(PIND, 3);
-	sbi(PIND, 4);
-}
-
-// Interrupt Service Routine for timer overflow to flip buzzer
-ISR(TIMER1_OVF_vect) {
-	if (is_buzzing) {
-		toggle_buzzer();
-		uint16_t remaining = buzzer_count - 1;
-		buzzer_count = remaining;
-		if (remaining == 0)
-			is_buzzing = 0;
-	}
 }
 
 // Typedef for random seed
@@ -198,38 +141,38 @@ inline uint8_t buttons_count(uint8_t mask) {
   as well as button lights and tones
  *---------------------------------------------------------------------------*/
 
-// Plays specified tone (half period in ticks) with specified count of half periods
-void play_tone(uint16_t tone, uint16_t count) {
-	prepare_buzzer();
-	set_buzzer(tone, count);
-	while (is_buzzing);
-	stop_buzzer();
-}
-
-// Plays specified tone with a specified length (ms)
-#define PLAY_TONE_LENGTH(tone, length) play_tone(tone, TONELEN2COUNT(tone, length));
-
 // Plays the loser sounds
 inline void play_loser(void) {
 	uint8_t i;
 	for (i = 0; i < 4; i++) {
 		set_leds((i & 1) ? (LED2 | LED3) : (LED0 | LED1));
-		PLAY_TONE_LENGTH(HZ2TONE(333.33), 250);
+		buzzer_wait(FREQLEN2TONECNT(333.33, 250));
+	}
+}
+
+// Next tone for play_winner
+volatile uint8_t winner_tone;
+
+// Plays current winner tone and decrements it for a higher note next
+void next_winner_tone() {
+	uint8_t tone = winner_tone;
+	if (tone > 70) {
+		start_buzzer(tone * (F_CPU / 1000000), 6, &next_winner_tone);
+		winner_tone = tone - 1;
+	} else {
+		stop_buzzer();
 	}
 }
 
 // Plays the winner sounds
 inline void play_winner(void) {
-	uint8_t x, z;
-	prepare_buzzer();
-	for (z = 0; z < 4; z++) {
-		set_leds((z & 1) ? (LED0 | LED3) : (LED1 | LED2));
-		for (x = 250; x > 70; x--) {
-			set_buzzer(x * (F_CPU / 1000000), 6);
-			while (is_buzzing);
-		}
+	uint8_t i;
+	for (i = 0; i < 4; i++) {
+		set_leds((i & 1) ? (LED0 | LED3) : (LED1 | LED2));
+		winner_tone = 250;
+		next_winner_tone();
+		while (is_buzzer_working());
 	}
-	stop_buzzer();
 }
 
 // Indicate the start of game play
@@ -254,7 +197,7 @@ inline static void play_start() {
 #define BUTTON_LENGTH_MS 150
 
 // Button Tone and Count array entries generation macro
-#define BTC(freq) HZ2TONE(freq), TONELEN2COUNT(HZ2TONE(freq), BUTTON_LENGTH_MS)
+#define BTC(freq) FREQLEN2TONECNT(freq, BUTTON_LENGTH_MS)
 
 // Current game variables
 uint8_t game_sequence[MAX_GAME_LEVEL]; // contains 0..3 button numbers for a game
@@ -272,7 +215,7 @@ uint16_t BUTTONS[8] = {
 void button_tone(uint8_t button) {
 	set_leds(_BV(button)); // Turn on button led
 	uint16_t *btc = &BUTTONS[2 * button]; // Pointer to BTC entry for the button
-	play_tone(*btc, *(btc + 1));
+	buzzer_wait(*btc, *(btc + 1));
 	set_leds(0);           // Turn off all LEDs
 }
 
